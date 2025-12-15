@@ -1,0 +1,604 @@
+<?php
+/**
+ * Traffic Management System - Fine Ledger
+ * Admin: Issue and manage fines
+ * Driver: View personal fines
+ */
+
+// Include configuration file
+require_once 'config.php';
+
+// Require user to be logged in
+requireLogin();
+
+// Get user information
+$userId = getSessionData('user_id');
+$role = getSessionData('role');
+
+$errors = [];
+$success = false;
+
+// Handle admin actions
+if ($_SERVER['REQUEST_METHOD'] == 'POST' && $role === 'admin') {
+    if (isset($_POST['issue_fine'])) {
+        // Issue new fine
+        $driverSsn = sanitizeInput($_POST['driver_ssn']);
+        $violationType = sanitizeInput($_POST['violation_type']);
+        $fineAmount = (float)$_POST['fine_amount'];
+        $description = sanitizeInput($_POST['description']);
+        $locationAddress = sanitizeInput($_POST['location_address']);
+        $dueDate = sanitizeInput($_POST['due_date']);
+        $incidentId = !empty($_POST['incident_id']) ? (int)$_POST['incident_id'] : null;
+        
+        // Validation
+        if (empty($driverSsn)) $errors[] = 'Driver SSN is required.';
+        if (empty($violationType)) $errors[] = 'Violation type is required.';
+        if ($fineAmount <= 0) $errors[] = 'Fine amount must be greater than 0.';
+        if (empty($dueDate)) $errors[] = 'Due date is required.';
+        if (!empty($dueDate) && strtotime($dueDate) <= time()) {
+            $errors[] = 'Due date must be in the future.';
+        }
+        
+        if (empty($errors)) {
+            try {
+                $pdo = getDBConnection();
+                
+                // Verify driver exists
+                $stmt = $pdo->prepare("SELECT COUNT(*) FROM driver WHERE ssn = ?");
+                $stmt->execute([$driverSsn]);
+                if ($stmt->fetchColumn() == 0) {
+                    $errors[] = 'Driver with this SSN does not exist.';
+                } else {
+                    $stmt = $pdo->prepare("
+                        INSERT INTO fine (driver_ssn, issued_by_admin_id, incident_id, violation_type, 
+                                        fine_amount, description, due_date, location_address) 
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ");
+                    $stmt->execute([$driverSsn, $userId, $incidentId, $violationType, 
+                                  $fineAmount, $description, $dueDate, $locationAddress]);
+                    
+                    $fineId = $pdo->lastInsertId();
+                    $success = "Fine #$fineId issued successfully!";
+                    logActivity('issue_fine', "Issued fine #$fineId to driver SSN: $driverSsn");
+                }
+            } catch (PDOException $e) {
+                $errors[] = 'Failed to issue fine.';
+                error_log("Issue fine error: " . $e->getMessage());
+            }
+        }
+        
+    } elseif (isset($_POST['update_fine_status'])) {
+        // Update fine status
+        $fineId = (int)$_POST['fine_id'];
+        $newStatus = sanitizeInput($_POST['status']);
+        $paymentMethod = sanitizeInput($_POST['payment_method']);
+        
+        try {
+            $pdo = getDBConnection();
+            $updateFields = ['status = ?'];
+            $updateValues = [$newStatus];
+            
+            if ($newStatus === 'paid') {
+                $updateFields[] = 'payment_date = NOW()';
+                if (!empty($paymentMethod)) {
+                    $updateFields[] = 'payment_method = ?';
+                    $updateValues[] = $paymentMethod;
+                }
+            }
+            
+            $updateValues[] = $fineId;
+            $stmt = $pdo->prepare("
+                UPDATE fine SET " . implode(', ', $updateFields) . " WHERE fine_id = ?
+            ");
+            $stmt->execute($updateValues);
+            
+            $success = "Fine status updated successfully!";
+            logActivity('update_fine_status', "Updated fine #$fineId status to $newStatus");
+        } catch (PDOException $e) {
+            $errors[] = 'Failed to update fine status.';
+            error_log("Update fine error: " . $e->getMessage());
+        }
+    }
+}
+
+// Get fines based on role
+$fines = [];
+$filters = [
+    'status' => $_GET['status'] ?? '',
+    'driver' => $_GET['driver'] ?? '',
+    'search' => $_GET['search'] ?? ''
+];
+
+try {
+    $pdo = getDBConnection();
+    
+    if ($role === 'admin') {
+        // Admin can see all fines
+        $whereClause = "WHERE 1=1";
+        $params = [];
+        
+        // Add filters
+        if (!empty($filters['status'])) {
+            $whereClause .= " AND f.status = ?";
+            $params[] = $filters['status'];
+        }
+        
+        if (!empty($filters['driver'])) {
+            $whereClause .= " AND (p.first_name LIKE ? OR p.last_name LIKE ? OR d.ssn LIKE ?)";
+            $searchTerm = '%' . $filters['driver'] . '%';
+            $params[] = $searchTerm;
+            $params[] = $searchTerm;
+            $params[] = $searchTerm;
+        }
+        
+        if (!empty($filters['search'])) {
+            $whereClause .= " AND (f.violation_type LIKE ? OR f.description LIKE ?)";
+            $searchTerm = '%' . $filters['search'] . '%';
+            $params[] = $searchTerm;
+            $params[] = $searchTerm;
+        }
+        
+        $query = "
+            SELECT f.*, d.license_number, p.first_name, p.last_name,
+                   admin_p.first_name as admin_first_name, admin_p.last_name as admin_last_name
+            FROM fine f 
+            JOIN driver d ON f.driver_ssn = d.ssn 
+            JOIN person p ON d.driver_id = p.id 
+            LEFT JOIN admin a ON f.issued_by_admin_id = a.admin_id
+            LEFT JOIN person admin_p ON a.admin_id = admin_p.id
+            $whereClause 
+            ORDER BY f.issue_date DESC
+        ";
+        
+    } else {
+        // Drivers/Users can only see their own fines
+        $whereClause = "WHERE d.driver_id = ?";
+        $params = [$userId];
+        
+        if (!empty($filters['status'])) {
+            $whereClause .= " AND f.status = ?";
+            $params[] = $filters['status'];
+        }
+        
+        $query = "
+            SELECT f.*, d.license_number,
+                   admin_p.first_name as admin_first_name, admin_p.last_name as admin_last_name
+            FROM fine f 
+            JOIN driver d ON f.driver_ssn = d.ssn 
+            LEFT JOIN admin a ON f.issued_by_admin_id = a.admin_id
+            LEFT JOIN person admin_p ON a.admin_id = admin_p.id
+            $whereClause 
+            ORDER BY f.issue_date DESC
+        ";
+    }
+    
+    $stmt = $pdo->prepare($query);
+    $stmt->execute($params);
+    $fines = $stmt->fetchAll();
+    
+} catch (PDOException $e) {
+    error_log("Fine fetch error: " . $e->getMessage());
+    $fines = [];
+}
+
+// Get drivers for admin form
+$drivers = [];
+if ($role === 'admin') {
+    try {
+        $stmt = $pdo->query("
+            SELECT d.ssn, d.license_number, p.first_name, p.last_name 
+            FROM driver d 
+            JOIN person p ON d.driver_id = p.id 
+            WHERE d.status = 'active' 
+            ORDER BY p.first_name, p.last_name
+        ");
+        $drivers = $stmt->fetchAll();
+    } catch (PDOException $e) {
+        error_log("Driver fetch error: " . $e->getMessage());
+    }
+}
+
+// Get recent incidents for fine association
+$recentIncidents = [];
+if ($role === 'admin') {
+    try {
+        $stmt = $pdo->query("
+            SELECT i.incident_id, i.incident_type, i.incident_date, i.location_address,
+                   p.first_name, p.last_name
+            FROM incident i 
+            JOIN person p ON i.reporter_id = p.id 
+            WHERE i.status IN ('reported', 'investigating') 
+            ORDER BY i.incident_date DESC 
+            LIMIT 10
+        ");
+        $recentIncidents = $stmt->fetchAll();
+    } catch (PDOException $e) {
+        error_log("Incident fetch error: " . $e->getMessage());
+    }
+}
+
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title><?php echo $role === 'admin' ? 'Fine Ledger' : 'My Fines'; ?> - <?php echo SITE_NAME; ?></title>
+    
+    <!-- Bootstrap CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- Font Awesome Icons -->
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <!-- Custom CSS -->
+    <link href="css/style.css" rel="stylesheet">
+</head>
+<body>
+    <!-- Header -->
+    <nav class="navbar navbar-expand-lg main-header">
+        <div class="container-fluid">
+            <a class="navbar-brand" href="dashboard.php">
+                <i class="fas fa-traffic-light me-2"></i><?php echo SITE_NAME; ?>
+            </a>
+            
+            <div class="navbar-nav ms-auto">
+                <a class="nav-link text-white" href="dashboard.php">
+                    <i class="fas fa-arrow-left me-2"></i>Back to Dashboard
+                </a>
+            </div>
+        </div>
+    </nav>
+    
+    <div class="container-fluid py-4">
+        <div class="row">
+            <?php if ($role === 'admin'): ?>
+                <!-- Issue Fine Form (Admin Only) -->
+                <div class="col-lg-4 mb-4">
+                    <div class="card">
+                        <div class="card-header">
+                            <h5 class="mb-0"><i class="fas fa-gavel me-2"></i>Issue New Fine</h5>
+                        </div>
+                        <div class="card-body">
+                            <?php if ($success): ?>
+                                <div class="alert alert-success">
+                                    <i class="fas fa-check-circle me-2"></i><?php echo $success; ?>
+                                </div>
+                            <?php endif; ?>
+                            
+                            <?php if (!empty($errors)): ?>
+                                <div class="alert alert-danger">
+                                    <h6><i class="fas fa-exclamation-triangle me-2"></i>Errors:</h6>
+                                    <ul class="mb-0">
+                                        <?php foreach ($errors as $error): ?>
+                                            <li><?php echo htmlspecialchars($error); ?></li>
+                                        <?php endforeach; ?>
+                                    </ul>
+                                </div>
+                            <?php endif; ?>
+                            
+                            <form method="POST" action="">
+                                <div class="mb-3">
+                                    <label for="driver_ssn" class="form-label">Driver *</label>
+                                    <select class="form-select" id="driver_ssn" name="driver_ssn" required>
+                                        <option value="">Select Driver</option>
+                                        <?php foreach ($drivers as $driver): ?>
+                                            <option value="<?php echo $driver['ssn']; ?>">
+                                                <?php echo htmlspecialchars($driver['first_name'] . ' ' . $driver['last_name'] . ' (' . $driver['license_number'] . ')'); ?>
+                                            </option>
+                                        <?php endforeach; ?>
+                                    </select>
+                                </div>
+                                
+                                <div class="mb-3">
+                                    <label for="violation_type" class="form-label">Violation Type *</label>
+                                    <select class="form-select" id="violation_type" name="violation_type" required>
+                                        <option value="">Select Violation</option>
+                                        <option value="Speeding">Speeding</option>
+                                        <option value="Running Red Light">Running Red Light</option>
+                                        <option value="Illegal Parking">Illegal Parking</option>
+                                        <option value="Reckless Driving">Reckless Driving</option>
+                                        <option value="No Insurance">No Insurance</option>
+                                        <option value="Expired Registration">Expired Registration</option>
+                                        <option value="DUI">DUI</option>
+                                        <option value="Texting While Driving">Texting While Driving</option>
+                                        <option value="Other">Other</option>
+                                    </select>
+                                </div>
+                                
+                                <div class="row">
+                                    <div class="col-6 mb-3">
+                                        <label for="fine_amount" class="form-label">Fine Amount ($) *</label>
+                                        <input type="number" class="form-control" id="fine_amount" name="fine_amount" 
+                                               step="0.01" min="0.01" required>
+                                    </div>
+                                    <div class="col-6 mb-3">
+                                        <label for="due_date" class="form-label">Due Date *</label>
+                                        <input type="date" class="form-control" id="due_date" name="due_date" required>
+                                    </div>
+                                </div>
+                                
+                                <div class="mb-3">
+                                    <label for="location_address" class="form-label">Location</label>
+                                    <input type="text" class="form-control" id="location_address" name="location_address" 
+                                           placeholder="Where the violation occurred">
+                                </div>
+                                
+                                <div class="mb-3">
+                                    <label for="incident_id" class="form-label">Related Incident</label>
+                                    <select class="form-select" id="incident_id" name="incident_id">
+                                        <option value="">No Related Incident</option>
+                                        <?php foreach ($recentIncidents as $incident): ?>
+                                            <option value="<?php echo $incident['incident_id']; ?>">
+                                                #<?php echo $incident['incident_id']; ?> - <?php echo ucfirst(str_replace('_', ' ', $incident['incident_type'])); ?> 
+                                                (<?php echo date('M j', strtotime($incident['incident_date'])); ?>)
+                                            </option>
+                                        <?php endforeach; ?>
+                                    </select>
+                                </div>
+                                
+                                <div class="mb-3">
+                                    <label for="description" class="form-label">Description</label>
+                                    <textarea class="form-control" id="description" name="description" rows="3" 
+                                              placeholder="Additional details about the violation..."></textarea>
+                                </div>
+                                
+                                <button type="submit" name="issue_fine" class="btn btn-primary w-100">
+                                    <i class="fas fa-gavel me-2"></i>Issue Fine
+                                </button>
+                            </form>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="col-lg-8">
+            <?php else: ?>
+                <div class="col-12">
+            <?php endif; ?>
+                
+                <!-- Fines List -->
+                <div class="card">
+                    <div class="card-header">
+                        <div class="row align-items-center">
+                            <div class="col-md-6">
+                                <h5 class="mb-0">
+                                    <i class="fas fa-file-invoice-dollar me-2"></i>
+                                    <?php echo $role === 'admin' ? 'All Fines' : 'My Fines'; ?> (<?php echo count($fines); ?>)
+                                </h5>
+                            </div>
+                            <div class="col-md-6 text-end">
+                                <?php if ($role !== 'admin'): ?>
+                                    <?php 
+                                    $totalPending = 0;
+                                    $totalOverdue = 0;
+                                    foreach ($fines as $fine) {
+                                        if ($fine['status'] === 'pending') {
+                                            $totalPending += $fine['fine_amount'];
+                                            if (strtotime($fine['due_date']) < time()) {
+                                                $totalOverdue += $fine['fine_amount'];
+                                            }
+                                        }
+                                    }
+                                    ?>
+                                    <div class="text-end">
+                                        <small class="text-muted">Total Pending: <strong>$<?php echo number_format($totalPending, 2); ?></strong></small><br>
+                                        <?php if ($totalOverdue > 0): ?>
+                                            <small class="text-danger">Overdue: <strong>$<?php echo number_format($totalOverdue, 2); ?></strong></small>
+                                        <?php endif; ?>
+                                    </div>
+                                <?php endif; ?>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="card-body">
+                        <!-- Filters -->
+                        <form method="GET" action="" class="row g-3 mb-4">
+                            <div class="col-md-4">
+                                <select class="form-select" name="status">
+                                    <option value="">All Statuses</option>
+                                    <option value="pending" <?php echo $filters['status'] === 'pending' ? 'selected' : ''; ?>>Pending</option>
+                                    <option value="paid" <?php echo $filters['status'] === 'paid' ? 'selected' : ''; ?>>Paid</option>
+                                    <option value="overdue" <?php echo $filters['status'] === 'overdue' ? 'selected' : ''; ?>>Overdue</option>
+                                    <option value="cancelled" <?php echo $filters['status'] === 'cancelled' ? 'selected' : ''; ?>>Cancelled</option>
+                                </select>
+                            </div>
+                            <?php if ($role === 'admin'): ?>
+                                <div class="col-md-4">
+                                    <input type="text" class="form-control" name="driver" placeholder="Search by driver name or SSN" 
+                                           value="<?php echo htmlspecialchars($filters['driver']); ?>">
+                                </div>
+                            <?php endif; ?>
+                            <div class="col-md-4">
+                                <div class="input-group">
+                                    <input type="text" class="form-control" name="search" placeholder="Search violations..." 
+                                           value="<?php echo htmlspecialchars($filters['search']); ?>">
+                                    <button type="submit" class="btn btn-outline-primary">
+                                        <i class="fas fa-search"></i>
+                                    </button>
+                                </div>
+                            </div>
+                        </form>
+                        
+                        <!-- Fines Table -->
+                        <?php if (!empty($fines)): ?>
+                            <div class="table-responsive">
+                                <table class="table table-hover">
+                                    <thead>
+                                        <tr>
+                                            <th>Fine ID</th>
+                                            <?php if ($role === 'admin'): ?>
+                                                <th>Driver</th>
+                                            <?php endif; ?>
+                                            <th>Violation</th>
+                                            <th>Amount</th>
+                                            <th>Issue Date</th>
+                                            <th>Due Date</th>
+                                            <th>Status</th>
+                                            <?php if ($role === 'admin'): ?>
+                                                <th>Actions</th>
+                                            <?php endif; ?>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <?php foreach ($fines as $fine): ?>
+                                            <?php 
+                                            $isOverdue = $fine['status'] === 'pending' && strtotime($fine['due_date']) < time();
+                                            $displayStatus = $isOverdue ? 'overdue' : $fine['status'];
+                                            ?>
+                                            <tr <?php echo $isOverdue ? 'class="table-warning"' : ''; ?>>
+                                                <td>#<?php echo $fine['fine_id']; ?></td>
+                                                <?php if ($role === 'admin'): ?>
+                                                    <td>
+                                                        <div class="small">
+                                                            <?php echo htmlspecialchars($fine['first_name'] . ' ' . $fine['last_name']); ?><br>
+                                                            <span class="text-muted"><?php echo htmlspecialchars($fine['license_number']); ?></span>
+                                                        </div>
+                                                    </td>
+                                                <?php endif; ?>
+                                                <td>
+                                                    <div class="small">
+                                                        <strong><?php echo htmlspecialchars($fine['violation_type']); ?></strong>
+                                                        <?php if ($fine['description']): ?>
+                                                            <br><span class="text-muted"><?php echo htmlspecialchars(substr($fine['description'], 0, 50)); ?><?php echo strlen($fine['description']) > 50 ? '...' : ''; ?></span>
+                                                        <?php endif; ?>
+                                                    </div>
+                                                </td>
+                                                <td><strong>$<?php echo number_format($fine['fine_amount'], 2); ?></strong></td>
+                                                <td><?php echo date('M j, Y', strtotime($fine['issue_date'])); ?></td>
+                                                <td>
+                                                    <?php echo date('M j, Y', strtotime($fine['due_date'])); ?>
+                                                    <?php if ($isOverdue): ?>
+                                                        <br><small class="text-danger">OVERDUE</small>
+                                                    <?php endif; ?>
+                                                </td>
+                                                <td>
+                                                    <span class="status-badge status-<?php echo $displayStatus; ?>">
+                                                        <?php echo ucfirst($displayStatus); ?>
+                                                    </span>
+                                                    <?php if ($fine['payment_date']): ?>
+                                                        <br><small class="text-muted">Paid: <?php echo date('M j, Y', strtotime($fine['payment_date'])); ?></small>
+                                                    <?php endif; ?>
+                                                </td>
+                                                <?php if ($role === 'admin'): ?>
+                                                    <td>
+                                                        <?php if ($fine['status'] === 'pending'): ?>
+                                                            <button type="button" class="btn btn-sm btn-outline-success" 
+                                                                    onclick="updateFineStatus(<?php echo $fine['fine_id']; ?>, 'paid')">
+                                                                <i class="fas fa-check"></i> Mark Paid
+                                                            </button>
+                                                        <?php endif; ?>
+                                                    </td>
+                                                <?php endif; ?>
+                                            </tr>
+                                        <?php endforeach; ?>
+                                    </tbody>
+                                </table>
+                            </div>
+                        <?php else: ?>
+                            <div class="text-center py-5">
+                                <i class="fas fa-file-invoice-dollar fa-3x text-muted mb-3"></i>
+                                <h5>No fines found</h5>
+                                <p class="text-muted">
+                                    <?php if ($role === 'admin'): ?>
+                                        No fines match your current filters.
+                                    <?php else: ?>
+                                        You have no fines on record. Keep driving safely!
+                                    <?php endif; ?>
+                                </p>
+                            </div>
+                        <?php endif; ?>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <?php if ($role === 'admin'): ?>
+        <!-- Update Fine Status Modal -->
+        <div class="modal fade" id="updateStatusModal" tabindex="-1">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title">Update Fine Status</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                    <form method="POST" action="">
+                        <div class="modal-body">
+                            <input type="hidden" name="fine_id" id="updateFineId">
+                            
+                            <div class="mb-3">
+                                <label for="updateStatus" class="form-label">Status</label>
+                                <select class="form-select" name="status" id="updateStatus" required>
+                                    <option value="pending">Pending</option>
+                                    <option value="paid">Paid</option>
+                                    <option value="overdue">Overdue</option>
+                                    <option value="cancelled">Cancelled</option>
+                                </select>
+                            </div>
+                            
+                            <div class="mb-3" id="paymentMethodGroup" style="display: none;">
+                                <label for="paymentMethod" class="form-label">Payment Method</label>
+                                <select class="form-select" name="payment_method" id="paymentMethod">
+                                    <option value="">Select method</option>
+                                    <option value="cash">Cash</option>
+                                    <option value="credit_card">Credit Card</option>
+                                    <option value="debit_card">Debit Card</option>
+                                    <option value="check">Check</option>
+                                    <option value="online">Online Payment</option>
+                                    <option value="money_order">Money Order</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="modal-footer">
+                            <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+                            <button type="submit" name="update_fine_status" class="btn btn-primary">
+                                <i class="fas fa-save me-2"></i>Update Status
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+    <?php endif; ?>
+    
+    <!-- Bootstrap JS -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    
+    <script>
+    // Set default due date to 30 days from now
+    document.addEventListener('DOMContentLoaded', function() {
+        const dueDateInput = document.getElementById('due_date');
+        if (dueDateInput) {
+            const thirtyDaysFromNow = new Date();
+            thirtyDaysFromNow.setDate(thirtyDaysFromNow.getDate() + 30);
+            dueDateInput.value = thirtyDaysFromNow.toISOString().split('T')[0];
+        }
+        
+        // Show/hide payment method based on status
+        const statusSelect = document.getElementById('updateStatus');
+        const paymentMethodGroup = document.getElementById('paymentMethodGroup');
+        
+        if (statusSelect) {
+            statusSelect.addEventListener('change', function() {
+                if (this.value === 'paid') {
+                    paymentMethodGroup.style.display = 'block';
+                } else {
+                    paymentMethodGroup.style.display = 'none';
+                }
+            });
+        }
+    });
+    
+    // Update fine status function
+    function updateFineStatus(fineId, status) {
+        document.getElementById('updateFineId').value = fineId;
+        document.getElementById('updateStatus').value = status;
+        
+        if (status === 'paid') {
+            document.getElementById('paymentMethodGroup').style.display = 'block';
+        }
+        
+        new bootstrap.Modal(document.getElementById('updateStatusModal')).show();
+    }
+    </script>
+</body>
+</html>
