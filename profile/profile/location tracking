@@ -1,0 +1,345 @@
+<?php
+/**
+ * Traffic Management System - Location Tracking
+ * Track and store location data with start/end points, time, and distance
+ */
+
+// Include configuration file
+require_once 'config.php';
+
+// Require user to be logged in
+requireLogin();
+
+// Get user information
+$userId = getSessionData('user_id');
+$role = getSessionData('role');
+
+$errors = [];
+$success = false;
+
+// Handle form submission for new location record
+if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_location'])) {
+    $startAddress = sanitizeInput($_POST['start_address']);
+    $endAddress = sanitizeInput($_POST['end_address']);
+    $startLatitude = !empty($_POST['start_latitude']) ? (float)$_POST['start_latitude'] : null;
+    $startLongitude = !empty($_POST['start_longitude']) ? (float)$_POST['start_longitude'] : null;
+    $endLatitude = !empty($_POST['end_latitude']) ? (float)$_POST['end_latitude'] : null;
+    $endLongitude = !empty($_POST['end_longitude']) ? (float)$_POST['end_longitude'] : null;
+    $startTime = sanitizeInput($_POST['start_time']);
+    $endTime = !empty($_POST['end_time']) ? sanitizeInput($_POST['end_time']) : null;
+    $distance = !empty($_POST['distance']) ? (float)$_POST['distance'] : null;
+    $purpose = sanitizeInput($_POST['purpose']);
+    $vehicleId = !empty($_POST['vehicle_id']) ? (int)$_POST['vehicle_id'] : null;
+    
+    // Validation
+    if (empty($startAddress)) $errors[] = 'Start address is required.';
+    if (empty($startTime)) $errors[] = 'Start time is required.';
+    if (!empty($endTime) && strtotime($endTime) <= strtotime($startTime)) {
+        $errors[] = 'End time must be after start time.';
+    }
+    
+    if (empty($errors)) {
+        try {
+            $pdo = getDBConnection();
+            $stmt = $pdo->prepare("
+                INSERT INTO location (user_id, start_latitude, start_longitude, end_latitude, end_longitude, 
+                                    start_address, end_address, start_time, end_time, distance_km, purpose, vehicle_id) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ");
+            $stmt->execute([
+                $userId, $startLatitude, $startLongitude, $endLatitude, $endLongitude,
+                $startAddress, $endAddress, $startTime, $endTime, $distance, $purpose, $vehicleId
+            ]);
+            
+            $success = true;
+            logActivity('add_location', "Added location record from: $startAddress");
+            
+        } catch (PDOException $e) {
+            $errors[] = 'Failed to save location record.';
+            error_log("Location save error: " . $e->getMessage());
+        }
+    }
+}
+
+// Get user's location history
+$locations = [];
+try {
+    $pdo = getDBConnection();
+    $stmt = $pdo->prepare("
+        SELECT l.*, v.license_plate, v.make, v.model 
+        FROM location l 
+        LEFT JOIN vehicle v ON l.vehicle_id = v.vehicle_id 
+        WHERE l.user_id = ? 
+        ORDER BY l.start_time DESC 
+        LIMIT 20
+    ");
+    $stmt->execute([$userId]);
+    $locations = $stmt->fetchAll();
+} catch (PDOException $e) {
+    error_log("Location fetch error: " . $e->getMessage());
+}
+
+// Get available vehicles for drivers
+$vehicles = [];
+if ($role === 'driver') {
+    try {
+        $stmt = $pdo->prepare("
+            SELECT v.* FROM vehicle v 
+            JOIN driver d ON v.assigned_driver_ssn = d.ssn 
+            WHERE d.driver_id = ?
+        ");
+        $stmt->execute([$userId]);
+        $vehicles = $stmt->fetchAll();
+    } catch (PDOException $e) {
+        error_log("Vehicle fetch error: " . $e->getMessage());
+    }
+}
+
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Location Tracking - <?php echo SITE_NAME; ?></title>
+    
+    <!-- Bootstrap CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- Font Awesome Icons -->
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <!-- Custom CSS -->
+    <link href="css/style.css" rel="stylesheet">
+</head>
+<body>
+    <!-- Header -->
+    <nav class="navbar navbar-expand-lg main-header">
+        <div class="container-fluid">
+            <a class="navbar-brand" href="dashboard.php">
+                <i class="fas fa-traffic-light me-2"></i><?php echo SITE_NAME; ?>
+            </a>
+            
+            <div class="navbar-nav ms-auto">
+                <a class="nav-link text-white" href="dashboard.php">
+                    <i class="fas fa-arrow-left me-2"></i>Back to Dashboard
+                </a>
+            </div>
+        </div>
+    </nav>
+    
+    <div class="container-fluid py-4">
+        <div class="row">
+            <!-- Add New Location Form -->
+            <div class="col-lg-6 mb-4">
+                <div class="card">
+                    <div class="card-header">
+                        <h5 class="mb-0"><i class="fas fa-plus-circle me-2"></i>Add Location Record</h5>
+                    </div>
+                    <div class="card-body">
+                        <?php if ($success): ?>
+                            <div class="alert alert-success">
+                                <i class="fas fa-check-circle me-2"></i>Location record added successfully!
+                            </div>
+                        <?php endif; ?>
+                        
+                        <?php if (!empty($errors)): ?>
+                            <div class="alert alert-danger">
+                                <h6><i class="fas fa-exclamation-triangle me-2"></i>Please fix the following errors:</h6>
+                                <ul class="mb-0">
+                                    <?php foreach ($errors as $error): ?>
+                                        <li><?php echo htmlspecialchars($error); ?></li>
+                                    <?php endforeach; ?>
+                                </ul>
+                            </div>
+                        <?php endif; ?>
+                        
+                        <form method="POST" action="">
+                            <div class="mb-3">
+                                <label for="start_address" class="form-label">Start Address *</label>
+                                <input type="text" class="form-control" id="start_address" name="start_address" 
+                                       placeholder="Enter starting location" required>
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label for="end_address" class="form-label">End Address</label>
+                                <input type="text" class="form-control" id="end_address" name="end_address" 
+                                       placeholder="Enter destination (optional)">
+                            </div>
+                            
+                            <div class="row">
+                                <div class="col-md-6 mb-3">
+                                    <label for="start_time" class="form-label">Start Time *</label>
+                                    <input type="datetime-local" class="form-control" id="start_time" name="start_time" required>
+                                </div>
+                                <div class="col-md-6 mb-3">
+                                    <label for="end_time" class="form-label">End Time</label>
+                                    <input type="datetime-local" class="form-control" id="end_time" name="end_time">
+                                </div>
+                            </div>
+                            
+                            <div class="row">
+                                <div class="col-md-6 mb-3">
+                                    <label for="distance" class="form-label">Distance (km)</label>
+                                    <input type="number" class="form-control" id="distance" name="distance" 
+                                           step="0.1" min="0" placeholder="0.0">
+                                </div>
+                                <div class="col-md-6 mb-3">
+                                    <label for="purpose" class="form-label">Purpose</label>
+                                    <select class="form-select" id="purpose" name="purpose">
+                                        <option value="">Select Purpose</option>
+                                        <option value="work">Work</option>
+                                        <option value="personal">Personal</option>
+                                        <option value="emergency">Emergency</option>
+                                        <option value="delivery">Delivery</option>
+                                        <option value="patrol">Patrol</option>
+                                        <option value="other">Other</option>
+                                    </select>
+                                </div>
+                            </div>
+                            
+                            <?php if (!empty($vehicles)): ?>
+                                <div class="mb-3">
+                                    <label for="vehicle_id" class="form-label">Vehicle</label>
+                                    <select class="form-select" id="vehicle_id" name="vehicle_id">
+                                        <option value="">Select Vehicle</option>
+                                        <?php foreach ($vehicles as $vehicle): ?>
+                                            <option value="<?php echo $vehicle['vehicle_id']; ?>">
+                                                <?php echo htmlspecialchars($vehicle['license_plate'] . ' - ' . $vehicle['make'] . ' ' . $vehicle['model']); ?>
+                                            </option>
+                                        <?php endforeach; ?>
+                                    </select>
+                                </div>
+                            <?php endif; ?>
+                            
+                            <!-- Coordinates (optional) -->
+                            <div class="row">
+                                <div class="col-md-6 mb-3">
+                                    <label for="start_latitude" class="form-label">Start Latitude</label>
+                                    <input type="number" class="form-control" id="start_latitude" name="start_latitude" 
+                                           step="0.0000001" placeholder="Optional">
+                                </div>
+                                <div class="col-md-6 mb-3">
+                                    <label for="start_longitude" class="form-label">Start Longitude</label>
+                                    <input type="number" class="form-control" id="start_longitude" name="start_longitude" 
+                                           step="0.0000001" placeholder="Optional">
+                                </div>
+                            </div>
+                            
+                            <div class="row">
+                                <div class="col-md-6 mb-3">
+                                    <label for="end_latitude" class="form-label">End Latitude</label>
+                                    <input type="number" class="form-control" id="end_latitude" name="end_latitude" 
+                                           step="0.0000001" placeholder="Optional">
+                                </div>
+                                <div class="col-md-6 mb-3">
+                                    <label for="end_longitude" class="form-label">End Longitude</label>
+                                    <input type="number" class="form-control" id="end_longitude" name="end_longitude" 
+                                           step="0.0000001" placeholder="Optional">
+                                </div>
+                            </div>
+                            
+                            <button type="submit" name="add_location" class="btn btn-primary">
+                                <i class="fas fa-save me-2"></i>Save Location Record
+                            </button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Location History -->
+            <div class="col-lg-6">
+                <div class="card">
+                    <div class="card-header">
+                        <h5 class="mb-0"><i class="fas fa-history me-2"></i>Location History</h5>
+                    </div>
+                    <div class="card-body">
+                        <?php if (!empty($locations)): ?>
+                            <div class="table-responsive">
+                                <table class="table table-hover">
+                                    <thead>
+                                        <tr>
+                                            <th>Start Address</th>
+                                            <th>End Address</th>
+                                            <th>Start Time</th>
+                                            <th>Distance</th>
+                                            <th>Purpose</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <?php foreach ($locations as $location): ?>
+                                            <tr>
+                                                <td>
+                                                    <div class="small">
+                                                        <?php echo htmlspecialchars(substr($location['start_address'], 0, 30)); ?>
+                                                        <?php if (strlen($location['start_address']) > 30) echo '...'; ?>
+                                                    </div>
+                                                </td>
+                                                <td>
+                                                    <div class="small">
+                                                        <?php if ($location['end_address']): ?>
+                                                            <?php echo htmlspecialchars(substr($location['end_address'], 0, 30)); ?>
+                                                            <?php if (strlen($location['end_address']) > 30) echo '...'; ?>
+                                                        <?php else: ?>
+                                                            <span class="text-muted">-</span>
+                                                        <?php endif; ?>
+                                                    </div>
+                                                </td>
+                                                <td>
+                                                    <div class="small">
+                                                        <?php echo date('M j, Y', strtotime($location['start_time'])); ?><br>
+                                                        <?php echo date('g:i A', strtotime($location['start_time'])); ?>
+                                                    </div>
+                                                </td>
+                                                <td>
+                                                    <?php if ($location['distance_km']): ?>
+                                                        <?php echo number_format($location['distance_km'], 1); ?> km
+                                                    <?php else: ?>
+                                                        <span class="text-muted">-</span>
+                                                    <?php endif; ?>
+                                                </td>
+                                                <td>
+                                                    <?php if ($location['purpose']): ?>
+                                                        <span class="badge bg-info"><?php echo ucfirst($location['purpose']); ?></span>
+                                                    <?php else: ?>
+                                                        <span class="text-muted">-</span>
+                                                    <?php endif; ?>
+                                                </td>
+                                            </tr>
+                                        <?php endforeach; ?>
+                                    </tbody>
+                                </table>
+                            </div>
+                        <?php else: ?>
+                            <div class="text-center py-4">
+                                <i class="fas fa-map-marker-alt fa-3x text-muted mb-3"></i>
+                                <h5>No location records yet</h5>
+                                <p class="text-muted">Start tracking your locations by adding a new record!</p>
+                            </div>
+                        <?php endif; ?>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Bootstrap JS -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    
+    <script>
+    // Set current time as default for start time
+    document.addEventListener('DOMContentLoaded', function() {
+        const now = new Date();
+        const currentDateTime = now.toISOString().slice(0, 16);
+        document.getElementById('start_time').value = currentDateTime;
+        
+        // Auto-calculate end time when start time changes
+        document.getElementById('start_time').addEventListener('change', function() {
+            if (!document.getElementById('end_time').value) {
+                const startTime = new Date(this.value);
+                const endTime = new Date(startTime.getTime() + (30 * 60000)); // Add 30 minutes
+                document.getElementById('end_time').value = endTime.toISOString().slice(0, 16);
+            }
+        });
+    });
+    </script>
+</body>
+</html>
