@@ -1,0 +1,474 @@
+<?php
+/**
+ * Traffic Management System - Vehicle Management
+ * CRUD operations for vehicle information (Admin only)
+ */
+
+// Include configuration file
+require_once 'config.php';
+
+// Require admin role
+requireRole('admin');
+
+$errors = [];
+$success = false;
+
+// Handle form submissions
+if ($_SERVER['REQUEST_METHOD'] == 'POST') {
+    if (isset($_POST['add_vehicle'])) {
+        // Add new vehicle
+        $licensePlate = sanitizeInput($_POST['license_plate']);
+        $make = sanitizeInput($_POST['make']);
+        $model = sanitizeInput($_POST['model']);
+        $year = (int)$_POST['year'];
+        $color = sanitizeInput($_POST['color']);
+        $vin = sanitizeInput($_POST['vin']);
+        $registrationExpiry = sanitizeInput($_POST['registration_expiry']);
+        $insuranceExpiry = sanitizeInput($_POST['insurance_expiry']);
+        $status = sanitizeInput($_POST['status']);
+        $assignedDriverSsn = !empty($_POST['assigned_driver_ssn']) ? sanitizeInput($_POST['assigned_driver_ssn']) : null;
+        
+        // Validation
+        if (empty($licensePlate)) $errors[] = 'License plate is required.';
+        if (empty($make)) $errors[] = 'Make is required.';
+        if (empty($model)) $errors[] = 'Model is required.';
+        if (empty($year) || $year < 1900 || $year > (date('Y') + 1)) $errors[] = 'Valid year is required.';
+        if (empty($color)) $errors[] = 'Color is required.';
+        if (empty($vin) || strlen($vin) !== 17) $errors[] = 'Valid VIN (17 characters) is required.';
+        if (empty($registrationExpiry)) $errors[] = 'Registration expiry is required.';
+        if (empty($insuranceExpiry)) $errors[] = 'Insurance expiry is required.';
+        
+        if (empty($errors)) {
+            try {
+                $pdo = getDBConnection();
+                
+                // Check if license plate or VIN already exists
+                $stmt = $pdo->prepare("SELECT COUNT(*) FROM vehicle WHERE license_plate = ? OR vin = ?");
+                $stmt->execute([$licensePlate, $vin]);
+                if ($stmt->fetchColumn() > 0) {
+                    $errors[] = 'License plate or VIN already exists.';
+                } else {
+                    $stmt = $pdo->prepare("
+                        INSERT INTO vehicle (license_plate, make, model, year, color, vin, 
+                                            registration_expiry, insurance_expiry, status, assigned_driver_ssn) 
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ");
+                    $stmt->execute([$licensePlate, $make, $model, $year, $color, $vin, 
+                                  $registrationExpiry, $insuranceExpiry, $status, $assignedDriverSsn]);
+                    
+                    $success = 'Vehicle added successfully!';
+                    logActivity('add_vehicle', "Added vehicle: $licensePlate");
+                }
+            } catch (PDOException $e) {
+                $errors[] = 'Failed to add vehicle.';
+                error_log("Add vehicle error: " . $e->getMessage());
+            }
+        }
+        
+    } elseif (isset($_POST['update_vehicle'])) {
+        // Update existing vehicle
+        $vehicleId = (int)$_POST['vehicle_id'];
+        $licensePlate = sanitizeInput($_POST['license_plate']);
+        $make = sanitizeInput($_POST['make']);
+        $model = sanitizeInput($_POST['model']);
+        $year = (int)$_POST['year'];
+        $color = sanitizeInput($_POST['color']);
+        $registrationExpiry = sanitizeInput($_POST['registration_expiry']);
+        $insuranceExpiry = sanitizeInput($_POST['insurance_expiry']);
+        $status = sanitizeInput($_POST['status']);
+        $assignedDriverSsn = !empty($_POST['assigned_driver_ssn']) ? sanitizeInput($_POST['assigned_driver_ssn']) : null;
+        
+        if (empty($errors)) {
+            try {
+                $pdo = getDBConnection();
+                $stmt = $pdo->prepare("
+                    UPDATE vehicle 
+                    SET license_plate = ?, make = ?, model = ?, year = ?, color = ?, 
+                        registration_expiry = ?, insurance_expiry = ?, status = ?, assigned_driver_ssn = ? 
+                    WHERE vehicle_id = ?
+                ");
+                $stmt->execute([$licensePlate, $make, $model, $year, $color, 
+                              $registrationExpiry, $insuranceExpiry, $status, $assignedDriverSsn, $vehicleId]);
+                
+                $success = 'Vehicle updated successfully!';
+                logActivity('update_vehicle', "Updated vehicle ID: $vehicleId");
+            } catch (PDOException $e) {
+                $errors[] = 'Failed to update vehicle.';
+                error_log("Update vehicle error: " . $e->getMessage());
+            }
+        }
+        
+    } elseif (isset($_POST['delete_vehicle'])) {
+        // Delete vehicle
+        $vehicleId = (int)$_POST['vehicle_id'];
+        
+        try {
+            $pdo = getDBConnection();
+            $stmt = $pdo->prepare("DELETE FROM vehicle WHERE vehicle_id = ?");
+            $stmt->execute([$vehicleId]);
+            
+            $success = 'Vehicle deleted successfully!';
+            logActivity('delete_vehicle', "Deleted vehicle ID: $vehicleId");
+        } catch (PDOException $e) {
+            $errors[] = 'Failed to delete vehicle.';
+            error_log("Delete vehicle error: " . $e->getMessage());
+        }
+    }
+}
+
+// Get all vehicles with driver information
+$vehicles = [];
+try {
+    $pdo = getDBConnection();
+    $stmt = $pdo->query("
+        SELECT v.*, d.driver_id, p.first_name, p.last_name 
+        FROM vehicle v 
+        LEFT JOIN driver d ON v.assigned_driver_ssn = d.ssn 
+        LEFT JOIN person p ON d.driver_id = p.id 
+        ORDER BY v.created_at DESC
+    ");
+    $vehicles = $stmt->fetchAll();
+} catch (PDOException $e) {
+    error_log("Vehicle fetch error: " . $e->getMessage());
+}
+
+// Get all drivers for assignment dropdown
+$drivers = [];
+try {
+    $stmt = $pdo->query("
+        SELECT d.ssn, d.license_number, p.first_name, p.last_name 
+        FROM driver d 
+        JOIN person p ON d.driver_id = p.id 
+        WHERE d.status = 'active' 
+        ORDER BY p.first_name, p.last_name
+    ");
+    $drivers = $stmt->fetchAll();
+} catch (PDOException $e) {
+    error_log("Driver fetch error: " . $e->getMessage());
+}
+
+// Get specific vehicle for editing
+$editVehicle = null;
+if (isset($_GET['edit'])) {
+    $editId = (int)$_GET['edit'];
+    try {
+        $stmt = $pdo->prepare("SELECT * FROM vehicle WHERE vehicle_id = ?");
+        $stmt->execute([$editId]);
+        $editVehicle = $stmt->fetch();
+    } catch (PDOException $e) {
+        error_log("Edit vehicle fetch error: " . $e->getMessage());
+    }
+}
+
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vehicle Management - <?php echo SITE_NAME; ?></title>
+    
+    <!-- Bootstrap CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- Font Awesome Icons -->
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <!-- Custom CSS -->
+    <link href="css/style.css" rel="stylesheet">
+</head>
+<body>
+    <!-- Header -->
+    <nav class="navbar navbar-expand-lg main-header">
+        <div class="container-fluid">
+            <a class="navbar-brand" href="dashboard.php">
+                <i class="fas fa-traffic-light me-2"></i><?php echo SITE_NAME; ?>
+            </a>
+            
+            <div class="navbar-nav ms-auto">
+                <a class="nav-link text-white" href="dashboard.php">
+                    <i class="fas fa-arrow-left me-2"></i>Back to Dashboard
+                </a>
+            </div>
+        </div>
+    </nav>
+    
+    <div class="container-fluid py-4">
+        <div class="row">
+            <!-- Add/Edit Vehicle Form -->
+            <div class="col-lg-4 mb-4">
+                <div class="card">
+                    <div class="card-header">
+                        <h5 class="mb-0">
+                            <i class="fas fa-<?php echo $editVehicle ? 'edit' : 'plus'; ?> me-2"></i>
+                            <?php echo $editVehicle ? 'Edit Vehicle' : 'Add New Vehicle'; ?>
+                        </h5>
+                    </div>
+                    <div class="card-body">
+                        <?php if ($success): ?>
+                            <div class="alert alert-success">
+                                <i class="fas fa-check-circle me-2"></i><?php echo $success; ?>
+                            </div>
+                        <?php endif; ?>
+                        
+                        <?php if (!empty($errors)): ?>
+                            <div class="alert alert-danger">
+                                <h6><i class="fas fa-exclamation-triangle me-2"></i>Errors:</h6>
+                                <ul class="mb-0">
+                                    <?php foreach ($errors as $error): ?>
+                                        <li><?php echo htmlspecialchars($error); ?></li>
+                                    <?php endforeach; ?>
+                                </ul>
+                            </div>
+                        <?php endif; ?>
+                        
+                        <form method="POST" action="">
+                            <?php if ($editVehicle): ?>
+                                <input type="hidden" name="vehicle_id" value="<?php echo $editVehicle['vehicle_id']; ?>">
+                            <?php endif; ?>
+                            
+                            <div class="mb-3">
+                                <label for="license_plate" class="form-label">License Plate *</label>
+                                <input type="text" class="form-control" id="license_plate" name="license_plate" 
+                                       value="<?php echo $editVehicle ? htmlspecialchars($editVehicle['license_plate']) : ''; ?>" 
+                                       required style="text-transform: uppercase;">
+                            </div>
+                            
+                            <div class="row">
+                                <div class="col-6 mb-3">
+                                    <label for="make" class="form-label">Make *</label>
+                                    <input type="text" class="form-control" id="make" name="make" 
+                                           value="<?php echo $editVehicle ? htmlspecialchars($editVehicle['make']) : ''; ?>" required>
+                                </div>
+                                <div class="col-6 mb-3">
+                                    <label for="model" class="form-label">Model *</label>
+                                    <input type="text" class="form-control" id="model" name="model" 
+                                           value="<?php echo $editVehicle ? htmlspecialchars($editVehicle['model']) : ''; ?>" required>
+                                </div>
+                            </div>
+                            
+                            <div class="row">
+                                <div class="col-6 mb-3">
+                                    <label for="year" class="form-label">Year *</label>
+                                    <input type="number" class="form-control" id="year" name="year" 
+                                           value="<?php echo $editVehicle ? $editVehicle['year'] : date('Y'); ?>" 
+                                           min="1900" max="<?php echo date('Y') + 1; ?>" required>
+                                </div>
+                                <div class="col-6 mb-3">
+                                    <label for="color" class="form-label">Color *</label>
+                                    <input type="text" class="form-control" id="color" name="color" 
+                                           value="<?php echo $editVehicle ? htmlspecialchars($editVehicle['color']) : ''; ?>" required>
+                                </div>
+                            </div>
+                            
+                            <?php if (!$editVehicle): ?>
+                            <div class="mb-3">
+                                <label for="vin" class="form-label">VIN *</label>
+                                <input type="text" class="form-control" id="vin" name="vin" 
+                                       maxlength="17" minlength="17" style="text-transform: uppercase;" required>
+                                <div class="form-text">17-character Vehicle Identification Number</div>
+                            </div>
+                            <?php endif; ?>
+                            
+                            <div class="row">
+                                <div class="col-6 mb-3">
+                                    <label for="registration_expiry" class="form-label">Registration Expiry *</label>
+                                    <input type="date" class="form-control" id="registration_expiry" name="registration_expiry" 
+                                           value="<?php echo $editVehicle ? $editVehicle['registration_expiry'] : ''; ?>" required>
+                                </div>
+                                <div class="col-6 mb-3">
+                                    <label for="insurance_expiry" class="form-label">Insurance Expiry *</label>
+                                    <input type="date" class="form-control" id="insurance_expiry" name="insurance_expiry" 
+                                           value="<?php echo $editVehicle ? $editVehicle['insurance_expiry'] : ''; ?>" required>
+                                </div>
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label for="status" class="form-label">Status *</label>
+                                <select class="form-select" id="status" name="status" required>
+                                    <option value="active" <?php echo ($editVehicle && $editVehicle['status'] === 'active') ? 'selected' : ''; ?>>Active</option>
+                                    <option value="inactive" <?php echo ($editVehicle && $editVehicle['status'] === 'inactive') ? 'selected' : ''; ?>>Inactive</option>
+                                    <option value="impounded" <?php echo ($editVehicle && $editVehicle['status'] === 'impounded') ? 'selected' : ''; ?>>Impounded</option>
+                                </select>
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label for="assigned_driver_ssn" class="form-label">Assigned Driver</label>
+                                <select class="form-select" id="assigned_driver_ssn" name="assigned_driver_ssn">
+                                    <option value="">No Assignment</option>
+                                    <?php foreach ($drivers as $driver): ?>
+                                        <option value="<?php echo $driver['ssn']; ?>" 
+                                                <?php echo ($editVehicle && $editVehicle['assigned_driver_ssn'] === $driver['ssn']) ? 'selected' : ''; ?>>
+                                            <?php echo htmlspecialchars($driver['first_name'] . ' ' . $driver['last_name'] . ' (' . $driver['license_number'] . ')'); ?>
+                                        </option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </div>
+                            
+                            <div class="d-grid gap-2">
+                                <?php if ($editVehicle): ?>
+                                    <button type="submit" name="update_vehicle" class="btn btn-primary">
+                                        <i class="fas fa-save me-2"></i>Update Vehicle
+                                    </button>
+                                    <a href="vehicles.php" class="btn btn-outline-secondary">
+                                        <i class="fas fa-times me-2"></i>Cancel Edit
+                                    </a>
+                                <?php else: ?>
+                                    <button type="submit" name="add_vehicle" class="btn btn-primary">
+                                        <i class="fas fa-plus me-2"></i>Add Vehicle
+                                    </button>
+                                <?php endif; ?>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Vehicles List -->
+            <div class="col-lg-8">
+                <div class="card">
+                    <div class="card-header">
+                        <h5 class="mb-0"><i class="fas fa-car me-2"></i>All Vehicles (<?php echo count($vehicles); ?>)</h5>
+                    </div>
+                    <div class="card-body">
+                        <?php if (!empty($vehicles)): ?>
+                            <div class="table-responsive">
+                                <table class="table table-hover">
+                                    <thead>
+                                        <tr>
+                                            <th>License Plate</th>
+                                            <th>Vehicle</th>
+                                            <th>Driver</th>
+                                            <th>Status</th>
+                                            <th>Expiry Dates</th>
+                                            <th>Actions</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <?php foreach ($vehicles as $vehicle): ?>
+                                            <tr>
+                                                <td>
+                                                    <strong><?php echo htmlspecialchars($vehicle['license_plate']); ?></strong>
+                                                </td>
+                                                <td>
+                                                    <div class="small">
+                                                        <?php echo htmlspecialchars($vehicle['make'] . ' ' . $vehicle['model']); ?><br>
+                                                        <span class="text-muted"><?php echo $vehicle['year']; ?> • <?php echo htmlspecialchars($vehicle['color']); ?></span>
+                                                    </div>
+                                                </td>
+                                                <td>
+                                                    <?php if ($vehicle['first_name']): ?>
+                                                        <div class="small">
+                                                            <?php echo htmlspecialchars($vehicle['first_name'] . ' ' . $vehicle['last_name']); ?>
+                                                        </div>
+                                                    <?php else: ?>
+                                                        <span class="text-muted">Unassigned</span>
+                                                    <?php endif; ?>
+                                                </td>
+                                                <td>
+                                                    <span class="status-badge status-<?php echo $vehicle['status']; ?>">
+                                                        <?php echo ucfirst($vehicle['status']); ?>
+                                                    </span>
+                                                </td>
+                                                <td>
+                                                    <div class="small">
+                                                        <div>Reg: <?php echo date('M j, Y', strtotime($vehicle['registration_expiry'])); ?></div>
+                                                        <div>Ins: <?php echo date('M j, Y', strtotime($vehicle['insurance_expiry'])); ?></div>
+                                                        
+                                                        <?php 
+                                                        $regExpiry = strtotime($vehicle['registration_expiry']);
+                                                        $insExpiry = strtotime($vehicle['insurance_expiry']);
+                                                        $thirtyDays = strtotime('+30 days');
+                                                        
+                                                        if ($regExpiry < time() || $insExpiry < time()): ?>
+                                                            <span class="badge bg-danger">EXPIRED</span>
+                                                        <?php elseif ($regExpiry < $thirtyDays || $insExpiry < $thirtyDays): ?>
+                                                            <span class="badge bg-warning">EXPIRING SOON</span>
+                                                        <?php endif; ?>
+                                                    </div>
+                                                </td>
+                                                <td>
+                                                    <div class="btn-group btn-group-sm">
+                                                        <a href="vehicles.php?edit=<?php echo $vehicle['vehicle_id']; ?>" 
+                                                           class="btn btn-outline-primary" title="Edit">
+                                                            <i class="fas fa-edit"></i>
+                                                        </a>
+                                                        <button type="button" class="btn btn-outline-danger" 
+                                                                onclick="confirmDelete(<?php echo $vehicle['vehicle_id']; ?>, '<?php echo addslashes($vehicle['license_plate']); ?>')" 
+                                                                title="Delete">
+                                                            <i class="fas fa-trash"></i>
+                                                        </button>
+                                                    </div>
+                                                </td>
+                                            </tr>
+                                        <?php endforeach; ?>
+                                    </tbody>
+                                </table>
+                            </div>
+                        <?php else: ?>
+                            <div class="text-center py-5">
+                                <i class="fas fa-car fa-3x text-muted mb-3"></i>
+                                <h5>No vehicles registered</h5>
+                                <p class="text-muted">Add your first vehicle using the form on the left.</p>
+                            </div>
+                        <?php endif; ?>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Delete Confirmation Modal -->
+    <div class="modal fade" id="deleteModal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Confirm Delete</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <p>Are you sure you want to delete vehicle <strong id="deleteVehiclePlate"></strong>?</p>
+                    <p class="text-danger"><i class="fas fa-exclamation-triangle me-2"></i>This action cannot be undone.</p>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <form method="POST" action="" class="d-inline">
+                        <input type="hidden" name="vehicle_id" id="deleteVehicleId">
+                        <button type="submit" name="delete_vehicle" class="btn btn-danger">
+                            <i class="fas fa-trash me-2"></i>Delete Vehicle
+                        </button>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Bootstrap JS -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    
+    <script>
+    // Confirm delete function
+    function confirmDelete(vehicleId, licensePlate) {
+        document.getElementById('deleteVehicleId').value = vehicleId;
+        document.getElementById('deleteVehiclePlate').textContent = licensePlate;
+        new bootstrap.Modal(document.getElementById('deleteModal')).show();
+    }
+    
+    // Auto-format license plate and VIN
+    document.addEventListener('DOMContentLoaded', function() {
+        const licensePlateInput = document.getElementById('license_plate');
+        const vinInput = document.getElementById('vin');
+        
+        if (licensePlateInput) {
+            licensePlateInput.addEventListener('input', function() {
+                this.value = this.value.toUpperCase();
+            });
+        }
+        
+        if (vinInput) {
+            vinInput.addEventListener('input', function() {
+                this.value = this.value.toUpperCase().replace(/[^A-Z0-9]/g, '').substring(0, 17);
+            });
+        }
+    });
+    </script>
+</body>
+</html>
